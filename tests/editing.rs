@@ -2056,3 +2056,184 @@ fn the_document_settles_and_stops_moving(cx: &mut TestAppContext) {
         "the block never stopped moving: {settled:#?}"
     );
 }
+
+#[gpui_kit::test]
+fn guest_toolbar_dispatches_only_declared_actions_without_changing_document(
+    cx: &mut TestAppContext,
+) {
+    use gpui_notion::editor::toolbar::{ToolbarAction, ToolbarItem};
+    let harness = setup(cx);
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&harness.editor, move |_, action: &ToolbarAction, _| {
+            observed.borrow_mut().push(action.tag.to_string())
+        })
+    });
+    harness.ui(cx, |_, cx| {
+        harness.editor.update(cx, |editor, cx| {
+            let before = editor.content();
+            editor.set_toolbar(
+                Some(vec![ToolbarItem {
+                    tag: "custom-action".into(),
+                    label: "Review selection".into(),
+                }]),
+                cx,
+            );
+            editor.choose_toolbar_action("missing", cx);
+            editor.choose_toolbar_action("custom-action", cx);
+            assert_eq!(editor.content(), before);
+        })
+    });
+    assert_eq!(&*events.borrow(), &["custom-action"]);
+}
+
+#[gpui_kit::test]
+fn external_annotations_emit_selection_without_private_threads(cx: &mut TestAppContext) {
+    use gpui_notion::editor::comments::{AnnotationMode, AnnotationRequested};
+    let harness = setup(cx);
+    harness.type_text("hello world", cx);
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = events.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&harness.editor, move |_, event: &AnnotationRequested, _| {
+            observed.borrow_mut().push(event.clone())
+        })
+    });
+    harness.ui(cx, |window, cx| {
+        harness.editor.update(cx, |editor, cx| {
+            editor.set_annotation_mode(AnnotationMode::External);
+            editor.select_text_in_block(0, 0..5, window, cx);
+            let before = editor.content();
+            editor.add_comment(window, cx);
+            assert_eq!(editor.content(), before);
+            assert!(!editor.comment_draft_is_open());
+        })
+    });
+    assert_eq!(events.borrow().len(), 1);
+    assert_eq!(events.borrow()[0].range, 0..5);
+}
+
+#[gpui_kit::test]
+fn application_suggestions_do_not_run_native_trigger_or_replacement_rules(cx: &mut TestAppContext) {
+    use gpui_notion::editor::slash::{ApplicationMenu, ApplicationMenuAnchor, MenuAction};
+    use gpui_notion::editor::toolbar::ToolbarItem;
+    let harness = setup(cx);
+    harness.ui(cx, |_, cx| {
+        harness
+            .editor
+            .update(cx, |editor, cx| editor.set_application_menu(None, cx))
+    });
+    harness.type_text("@", cx);
+    assert!(
+        !cx.update(|cx| harness.editor.read(cx).suggestion_is_open()),
+        "the application owns trigger detection"
+    );
+    let actions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = actions.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&harness.editor, move |_, action: &MenuAction, _| {
+            captured.lock().unwrap().push(action.clone());
+        })
+    });
+    harness.ui(cx, |window, cx| window.click(("block", 1usize), cx));
+    assert!(
+        actions.lock().unwrap().is_empty(),
+        "a closed menu has nothing to dismiss"
+    );
+    harness.ui(cx, |_, cx| {
+        harness.editor.update(cx, |editor, cx| {
+            editor.set_application_menu(
+                Some(ApplicationMenu {
+                    anchor: ApplicationMenuAnchor::Caret,
+                    items: vec![ToolbarItem {
+                        tag: "opaque-action".into(),
+                        label: "Application choice".into(),
+                    }],
+                    selected: 0,
+                }),
+                cx,
+            )
+        })
+    });
+    assert!(cx.update(|cx| harness.editor.read(cx).suggestion_is_open()));
+    harness.press("enter", cx);
+    assert_eq!(
+        harness.texts(cx),
+        vec!["@"],
+        "a menu pick never replaces source text"
+    );
+    assert_eq!(
+        *actions.lock().unwrap(),
+        vec![MenuAction::Pick("opaque-action".into())]
+    );
+}
+
+#[gpui_kit::test]
+fn caret_changes_are_observed_without_turning_repaints_into_edits(cx: &mut TestAppContext) {
+    use gpui_notion::editor::view::{DocumentChanged, SelectionChanged};
+    let harness = setup(cx);
+    harness.type_text("hello", cx);
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let selections = events.clone();
+    let documents = events.clone();
+    let _selection = cx.update(|cx| {
+        cx.subscribe(&harness.editor, move |_, _: &SelectionChanged, _| {
+            selections.borrow_mut().push("selection");
+        })
+    });
+    let _document = cx.update(|cx| {
+        cx.subscribe(&harness.editor, move |_, _: &DocumentChanged, _| {
+            documents.borrow_mut().push("document");
+        })
+    });
+    harness.press("left", cx);
+    assert_eq!(*events.borrow(), vec!["selection"]);
+    harness.ui(cx, |_, _| {});
+    assert_eq!(
+        *events.borrow(),
+        vec!["selection"],
+        "a repaint changes no selection"
+    );
+    harness.press("shift-left", cx);
+    assert_eq!(*events.borrow(), vec!["selection", "selection"]);
+    assert_eq!(harness.texts(cx), vec!["hello"]);
+}
+
+#[gpui_kit::test]
+fn application_input_rules_leave_typed_and_pasted_source_unchanged(cx: &mut TestAppContext) {
+    use gpui_notion::editor::input_rules::InputRuleMode;
+    for source in ["# Title", "**bold**", "(c)"] {
+        let harness = setup(cx);
+        harness.ui(cx, |_, cx| {
+            harness.editor.update(cx, |editor, _| {
+                editor.set_input_rule_mode(InputRuleMode::Application);
+            })
+        });
+        harness.type_text(source, cx);
+        assert_eq!(
+            harness.texts(cx).join("\n"),
+            source,
+            "source belongs to the application"
+        );
+        assert!(harness.types(cx).iter().all(|kind| kind == "paragraph"));
+        cx.update(|cx| {
+            assert!(
+                harness.editor.read(cx).content().iter().all(|block| block
+                    .marks
+                    .iter()
+                    .next()
+                    .is_none())
+            )
+        });
+    }
+    let harness = setup(cx);
+    harness.ui(cx, |_, cx| {
+        harness.editor.update(cx, |editor, _| {
+            editor.set_input_rule_mode(InputRuleMode::Application);
+        })
+    });
+    harness.ui(cx, |window, cx| window.input("first\n# second", cx));
+    assert_eq!(harness.texts(cx), vec!["first", "# second"]);
+    assert_eq!(harness.types(cx), vec!["paragraph", "paragraph"]);
+}
